@@ -1,5 +1,1 @@
-[client]
-listen_port = 9768
-
-[controls]
-listen_port = 9864
+# empty config for now

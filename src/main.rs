@@ -1,9 +1,10 @@
 #[macro_use]
 use log::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::*;
 
 use std::error::Error;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 struct CranProcessor {
@@ -34,30 +35,119 @@ fn init_logging() {
     debug!("Logger initialized");
 }
 
+use serde::Deserialize;
+#[derive(Deserialize)]
+struct Config {
+    client_port: u16,
+    control_port: u16,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            client_port: 8080,
+            control_port: 8090,
+        }
+    }
+}
+
+fn find_cfg() -> Option<std::path::PathBuf> {
+    let locations = vec!["cranserver.toml", "/etc/cranserver/cranserver.toml"];
+
+    for l in &locations {
+        let p = std::path::PathBuf::from(l);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn get_config() -> Result<Option<Config>, Box<dyn std::error::Error>> {
+    if let Some(cfg) = find_cfg() {
+        Ok(Some(toml::from_str(&std::fs::read_to_string(cfg)?)?))
+    } else {
+        use std::io::{Error, ErrorKind};
+        Err(Box::new(Error::new(
+            ErrorKind::NotFound,
+            "Config file was not found.",
+        )))
+    }
+}
+
+async fn accept_clients(address: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind(address).await?;
+    let (socket, ip) = listener.accept().await?;
+
+    info!("Client connection {} accepted.", ip);
+    tokio::spawn(async move {
+        // process & await
+    });
+    Ok(())
+}
+
+async fn accept_controls(address: std::net::SocketAddr) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind(address).await?;
+    let (mut socket, ip) = listener.accept().await?;
+
+    info!("Controller connection {} accepted.", ip);
+    tokio::spawn(async move {
+        // process & await
+        while socket.readable().await.is_ok() {
+            let mut msg = Vec::new();
+            socket.read_buf(&mut msg).await.unwrap();
+            info!(
+                "Message recieved from {}: {}",
+                ip,
+                std::str::from_utf8(&msg).unwrap()
+            );
+            if msg.len() == 0 {
+                error!("Connection closed");
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
     init_logging();
-    let mut ping_interval = Instant::now();
-    let mut connect_interval = tokio::time::interval(Duration::from_secs(15));
 
-    // Loop this at an interval upon failure
-    debug!("Attempting connection to client.");
+    let cfg = get_config()
+        .unwrap_or_else(|e| {
+            warn!("Failed to get config. Using default settings. ({})", e);
+            Some(Default::default())
+        })
+        .unwrap_or_else(|| {
+            panic!("No configuration found and no default fallback.");
+        });
 
-    connect_interval.tick().await;
-    if let Ok(mut cran) = CranProcessor::new().await {
-        info!("Successfully connected to client.");
+    let client_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), cfg.client_port);
+    let ctrl_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), cfg.control_port);
 
-        //while cran.connected().await.is_ok() {
+    let task_clients = tokio::spawn(async move {
         loop {
-            // Measure ping every 3 seconds
-            if ping_interval.elapsed() > Duration::from_secs(3) {
-                ping_interval = Instant::now();
-                info!(
-                    "Ping to client: {}",
-                    cran.ping_client().await.unwrap().as_millis()
-                );
-            }
+            debug!(
+                "Listening for new client connections on port {}",
+                client_addr.port()
+            );
+            accept_clients(client_addr).await.unwrap();
         }
-    }
+    });
+    let task_ctrl = tokio::spawn(async move {
+        loop {
+            debug!(
+                "Listening for new controller connections on port {}",
+                ctrl_addr.port()
+            );
+            accept_controls(ctrl_addr).await.unwrap();
+        }
+    });
+
+    info!("Initialization done. Ready!");
+    task_clients.await?;
+    task_ctrl.await?;
+
     Ok(())
 }
