@@ -73,7 +73,7 @@ impl Into<Vec<u8>> for StatusPacket {
     }
 }
 
-pub async fn process<T>(client_type: ClientType, raw_packet: T) -> Result<CranPacket, Box<Error>>
+pub async fn process<T>(client_type: ClientType, raw_packet: T) -> Result<CranPacket, Box<dyn Error>>
 where
     T: Into<Vec<u8>>,
 {
@@ -91,17 +91,11 @@ where
             .unwrap();
 
         use std::io::{Read, Write};
-        hex.stdin.unwrap().write_all(&raw_packet);
+        hex.stdin.unwrap().write_all(&raw_packet)?;
         let mut s = String::new();
-        hex.stdout.unwrap().read_to_string(&mut s);
+        hex.stdout.unwrap().read_to_string(&mut s)?;
         debug!("Hexdump of deserialized packet:\n{}", s);
     }
 
-    match packet.packet_type {
-        PacketType::Status => {
-            info!("Status packet recieved.");
-        }
-        _ => unimplemented!(),
-    }
     Ok(packet)
 }

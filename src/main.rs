@@ -7,9 +7,6 @@ use tokio::sync::{mpsc, Mutex};
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 
-#[macro_use]
-use serde::{self, Deserialize, Serialize};
-
 mod config;
 #[macro_use]
 mod packets;
@@ -46,7 +43,7 @@ async fn handle(
             0
         }) > 0
         {
-            let client_info = packets::ClientInfo::new(ip.into(), client_type);
+            let client_info = packets::ClientInfo::new(ip, client_type);
             if let Err(e) = tx.send((client_info, buf.clone())).await {
                 error!("Reciever dropped ({})", e);
                 break;
@@ -79,10 +76,6 @@ async fn act_as_client(of_type: packets::ClientType) -> Result<(), Box<dyn Error
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
-    // 1. Packet formats
-    // --> 2. Commands / Operations
-    // 3. Command executor / Cran Processor
-
     init_logging();
 
     if std::env::args().rfind(|s| s == "-client").is_some() {
@@ -145,6 +138,7 @@ async fn main() -> tokio::io::Result<()> {
                 packet.unwrap()
             };
 
+            // TODO (later) move this code into packets::process()
             use packets::{CranPacket, PacketType, StatusPacket};
             let response: Option<CranPacket> = match packet.packet_type {
                 PacketType::Status => {
