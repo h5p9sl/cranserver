@@ -18,16 +18,40 @@ pub fn serializer() -> impl bincode::Options {
 }
 */
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Copy, Clone, Debug)]
 pub enum ClientType {
     Client,
     Controller,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(Serialize, Deserialize, Eq, Copy, Clone, Debug)]
 pub struct ClientInfo {
     pub address: SocketAddr,
     pub client_type: ClientType,
+}
+
+use std::hash::{Hash, Hasher};
+impl Hash for ClientInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+        self.client_type.hash(state);
+    }
+}
+
+impl std::fmt::Display for ClientInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        write!(f, "{}", h.finish())?;
+        Ok(())
+    }
+}
+
+impl PartialEq for ClientInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+    }
 }
 
 impl ClientInfo {
@@ -73,7 +97,7 @@ impl Into<Vec<u8>> for StatusPacket {
     }
 }
 
-pub async fn process<T>(client_type: ClientType, raw_packet: T) -> Result<CranPacket, Box<dyn Error>>
+pub async fn process<T>(raw_packet: T) -> Result<CranPacket, Box<dyn Error>>
 where
     T: Into<Vec<u8>>,
 {
@@ -81,7 +105,6 @@ where
 
     use bincode::Options;
     let packet: CranPacket = serializer!().deserialize(&raw_packet)?;
-    debug!("Deserialized packet: {:#?}", &packet);
     {
         let hex = std::process::Command::new("hexdump")
             .arg("-C")
@@ -90,11 +113,23 @@ where
             .spawn()
             .unwrap();
 
+        use std::fmt::Write as _;
         use std::io::{Read, Write};
+
+        let mut msg = String::new();
+
+        writeln!(
+            msg,
+            "Packet of type {:?} and size {}.",
+            &packet.packet_type,
+            &packet.data.len()
+        )?;
+        writeln!(msg, "Hexdump of packet:")?;
+
         hex.stdin.unwrap().write_all(&raw_packet)?;
-        let mut s = String::new();
-        hex.stdout.unwrap().read_to_string(&mut s)?;
-        debug!("Hexdump of deserialized packet:\n{}", s);
+        hex.stdout.unwrap().read_to_string(&mut msg)?;
+
+        debug!("{}", msg);
     }
 
     Ok(packet)

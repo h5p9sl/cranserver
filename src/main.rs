@@ -1,3 +1,4 @@
+#![feature(map_into_keys_values)]
 use log::*;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,37 +20,51 @@ fn init_logging() {
     debug!("Logger initialized");
 }
 
-type SocketList = Arc<Mutex<std::collections::HashMap<SocketAddr, TcpStream>>>;
+type SocketList = Arc<Mutex<std::collections::HashMap<packets::ClientInfo, TcpStream>>>;
 type PacketChannel = (packets::ClientInfo, Vec<u8>);
 
 /// Accept and handle new connections from `ip`
 async fn handle(
-    client_type: packets::ClientType,
+    client: packets::ClientInfo,
     tx: mpsc::Sender<PacketChannel>,
-    ip: std::net::SocketAddr,
     sockets: SocketList,
 ) -> Result<(), Box<dyn Error>> {
+    let client_type = client.client_type;
+    let ip = client.address;
     info!("{:?} connection {} accepted.", client_type, ip);
     tokio::spawn(async move {
-        // wait until socket is readable
-        let mut sockets = sockets.lock().await;
-        let s = sockets.get_mut(&ip).unwrap();
-        s.readable().await.unwrap();
-
-        // read packets into buf
-        let mut buf = Vec::new();
-        while s.read_buf(&mut buf).await.unwrap_or_else(|e| {
-            error!("Socket with {} read failure: {}", ip, e);
-            0
-        }) > 0
-        {
-            let client_info = packets::ClientInfo::new(ip, client_type);
-            if let Err(e) = tx.send((client_info, buf.clone())).await {
-                error!("Reciever dropped ({})", e);
+        loop {
+            // wait until socket is readable
+            let mut sockets = sockets.lock().await;
+            let s = sockets.get_mut(&client);
+            if s.is_none() {
                 break;
             }
+
+            // read packets into buf
+            let mut buf = Vec::new();
+            match s.unwrap().try_read_buf(&mut buf) {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+                Ok(0) => {
+                    break;
+                }
+                Ok(_n) => {
+                    let client_info = packets::ClientInfo::new(ip, client_type);
+                    if let Err(e) = tx.send((client_info, buf.clone())).await {
+                        error!("Reciever dropped ({})", e);
+                        break;
+                    }
+                }
+            }
         }
-        info!("Connection with {} terminated.", ip);
+        info!("Connection with {} terminated.", &client.address);
+        sockets.lock().await.remove(&client);
+        Ok(())
     });
     Ok(())
 }
@@ -64,14 +79,69 @@ async fn act_as_client(of_type: packets::ClientType) -> Result<(), Box<dyn Error
         ClientType::Client => {
             let packet = CranPacket::new(PacketType::Status, []);
             let packet = serializer.serialize(&packet).unwrap();
+            let mut buf = Vec::new();
 
+            debug!("Sending packet...");
             stream.write_all(&packet).await?;
+            info!("Sent packet!");
 
-            tokio::time::sleep(std::time::Duration::from_secs_f32(1.0)).await;
+            stream.readable().await?;
+            debug!("Awaiting packet...");
+            stream.read_buf(&mut buf).await?;
+            info!("Recieved packet of length {}", buf.len());
+
+            let packet = packets::process(&*buf).await;
+            if let Ok(packet) = packet {
+                match packet.packet_type {
+                    packets::PacketType::Status => {
+                        let inner: StatusPacket = serializer.deserialize(&packet.data).unwrap();
+                        info!("Status retrieved: {:#?}", inner);
+                    }
+                    _ => {}
+                }
+            } else {
+                error!("Packet failed to process: {:?}", packet.err());
+            }
+
+            info!("Closing stream...");
         }
         ClientType::Controller => unimplemented!(),
     }
     Ok(())
+}
+
+async fn accept_and_handle_connections(
+    client_type: packets::ClientType,
+    listen_addr: SocketAddr,
+    tx: mpsc::Sender<PacketChannel>,
+    sockets: SocketList,
+) {
+    let listener = TcpListener::bind(listen_addr).await.unwrap();
+    debug!(
+        "Listening for new {:?} connections on port {}",
+        client_type,
+        listen_addr.port(),
+    );
+
+    loop {
+        match listener.accept().await {
+            Ok((s, ip)) => {
+                // Clone references
+                let channel = tx.clone();
+                let sockets = sockets.clone();
+
+                tokio::spawn(async move {
+                    // Add this socket to the socketlist and begin recieving packets
+                    let info = packets::ClientInfo::new(ip, client_type);
+                    sockets.lock().await.insert(info, s);
+                    handle(info, channel.clone(), sockets.clone())
+                        .await
+                        .unwrap();
+                });
+            }
+            Err(e) => error!("Error accepting socket: {:?}", e),
+        }
+    }
 }
 
 #[tokio::main]
@@ -94,61 +164,53 @@ async fn main() -> tokio::io::Result<()> {
     let ctrl_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), cfg.control_port);
 
     let sockets: SocketList = Default::default();
-
     let (tx, mut rx) = mpsc::channel::<PacketChannel>(8);
 
-    let accept_and_handle_connections = |client_type, listen_addr| {
-        let channel = tx.clone();
+    // Creates a new tokio task for the specified socket address
+    let new_socket_task = |client_type, listen_addr| {
+        let tx = tx.clone();
         let sockets = sockets.clone();
         tokio::spawn(async move {
-            let listener = TcpListener::bind(listen_addr).await.unwrap();
-            debug!(
-                "Listening for new {:?} connections on port {}",
-                client_type,
-                listener.local_addr().unwrap().port()
-            );
-            while let Ok((s, ip)) = listener.accept().await {
-                sockets.lock().await.insert(ip, s);
-                handle(client_type, channel.clone(), ip, sockets.clone())
-                    .await
-                    .unwrap();
-            }
+            accept_and_handle_connections(client_type, listen_addr, tx, sockets).await;
         })
     };
-    let t_clients = accept_and_handle_connections(packets::ClientType::Client, client_addr);
-    let t_ctrl = accept_and_handle_connections(packets::ClientType::Controller, ctrl_addr);
+    let t_clients = new_socket_task(packets::ClientType::Client, client_addr);
+    let t_ctrl = new_socket_task(packets::ClientType::Controller, ctrl_addr);
 
-    // Packet processing & response thread
+    // Packet processing & response task
     // EXPECTED BEHAVIOUR:
     //      aproximately 1 thread per queued packet
     //      deserialize packets, pass inner data down to a function
     //      return, serialize & send response
     let t_commands = tokio::spawn(async move {
         while let Some((client_info, packet)) = rx.recv().await {
-            let ci = client_info;
+            debug!("Packet recieved through channel: {} bytes", packet.len());
+            if packet.is_empty() {
+                error!("Empty packet recieved: closing socket");
+                sockets.lock().await.remove(&client_info);
+                continue;
+            }
 
             // dereferenced borrow of `packet`, slightly unusual!
-            let packet = packets::process(ci.client_type, &*packet).await;
-            let packet = {
-                if let Err(e) = &packet {
-                    error!("Failed to process packet: {}", e);
-                    debug!("{:#?}", packet);
-                    continue;
-                }
-                packet.unwrap()
-            };
+            debug!("Processing packet (1/3)");
+            let packet = packets::process(&*packet).await.unwrap();
+
+            use bincode::Options;
+            let serializer = serializer!();
 
             // TODO (later) move this code into packets::process()
             use packets::{CranPacket, PacketType, StatusPacket};
             let response: Option<CranPacket> = match packet.packet_type {
                 PacketType::Status => {
-                    // TODO Put data in response packet
+                    debug!("Status packet recieved");
+                    dbg!(sockets.lock().await);
                     Some(CranPacket::new(
                         PacketType::Status,
-                        Vec::new(), /*
-                                    StatusPacket {
-                                    }.into()
-                                    */
+                        serializer
+                            .serialize(&StatusPacket {
+                                connected_clients: sockets.lock().await.keys().copied().collect(),
+                            })
+                            .unwrap(),
                     ))
                 }
                 _ => None,
@@ -157,7 +219,20 @@ async fn main() -> tokio::io::Result<()> {
             if let Some(response) = response {
                 use bincode::Options;
                 let packet = serializer!().serialize(&response).unwrap();
-                // TODO send response to client
+
+                debug!("Awaiting socket-list lock... (2/3)");
+                let mut sockets = sockets.lock().await;
+                if let Some(stream) = sockets.get_mut(&client_info) {
+                debug!(
+                    "Sending response packet to {}... (3/3)",
+                    &client_info.address
+                );
+                let _ = packets::process(&*packet).await;
+                stream.writable().await.unwrap();
+                stream.write_all(&packet).await.unwrap();
+                } else {
+                    error!("Failed to send response: socket no longer exists.");
+                }
             }
         }
     });
