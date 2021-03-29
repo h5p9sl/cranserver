@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use log::*;
 use serde::{self, Deserialize, Serialize};
 use std::error::Error;
@@ -90,19 +91,7 @@ pub struct StatusPacket {
     pub connected_clients: Vec<ClientInfo>,
 }
 
-impl Into<Vec<u8>> for StatusPacket {
-    fn into(self) -> Vec<u8> {
-        use bincode::Options;
-        serializer!().serialize(&self).unwrap()
-    }
-}
-
-pub async fn process<T>(raw_packet: T) -> Result<CranPacket, Box<dyn Error>>
-where
-    T: Into<Vec<u8>>,
-{
-    let raw_packet = raw_packet.into();
-
+pub async fn process(raw_packet: &BytesMut) -> Result<CranPacket, Box<dyn Error>> {
     use bincode::Options;
     let packet: CranPacket = serializer!().deserialize(&raw_packet)?;
     {

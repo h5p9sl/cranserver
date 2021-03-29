@@ -1,1 +1,5 @@
-# empty config for now
+# The port the server will listen for new client connections
+client_port = 8080
+# The port the server will listen for new control connections
+control_port = 8090
+

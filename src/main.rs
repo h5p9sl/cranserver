@@ -1,16 +1,22 @@
-#![feature(map_into_keys_values)]
 use log::*;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-
+use bytes::BytesMut;
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
+};
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 mod config;
-#[macro_use]
 mod packets;
+use packets::{CranPacket, PacketType, StatusPacket};
+
+type SocketList = Arc<Mutex<std::collections::HashMap<packets::ClientInfo, OwnedWriteHalf>>>;
+type PacketChannel = (packets::ClientInfo, BytesMut);
 
 fn init_logging() {
     env_logger::builder()
@@ -20,77 +26,25 @@ fn init_logging() {
     debug!("Logger initialized");
 }
 
-type SocketList = Arc<Mutex<std::collections::HashMap<packets::ClientInfo, TcpStream>>>;
-type PacketChannel = (packets::ClientInfo, Vec<u8>);
-
-/// Accept and handle new connections from `ip`
-async fn handle(
-    client: packets::ClientInfo,
-    tx: mpsc::Sender<PacketChannel>,
-    sockets: SocketList,
-) -> Result<(), Box<dyn Error>> {
-    let client_type = client.client_type;
-    let ip = client.address;
-    info!("{:?} connection {} accepted.", client_type, ip);
-    tokio::spawn(async move {
-        loop {
-            // wait until socket is readable
-            let mut sockets = sockets.lock().await;
-            let s = sockets.get_mut(&client);
-            if s.is_none() {
-                break;
-            }
-
-            // read packets into buf
-            let mut buf = Vec::new();
-            match s.unwrap().try_read_buf(&mut buf) {
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-                Ok(0) => {
-                    break;
-                }
-                Ok(_n) => {
-                    let client_info = packets::ClientInfo::new(ip, client_type);
-                    if let Err(e) = tx.send((client_info, buf.clone())).await {
-                        error!("Reciever dropped ({})", e);
-                        break;
-                    }
-                }
-            }
-        }
-        info!("Connection with {} terminated.", &client.address);
-        sockets.lock().await.remove(&client);
-        Ok(())
-    });
-    Ok(())
-}
-
 async fn act_as_client(of_type: packets::ClientType) -> Result<(), Box<dyn Error>> {
     use bincode::Options;
     use packets::*;
     let serializer = bincode::options().with_big_endian().with_fixint_encoding();
-    let mut stream = TcpStream::connect("127.0.0.1:8080").await?;
+    let stream = TcpStream::connect("127.0.0.1:8080").await?;
 
     match of_type {
         ClientType::Client => {
             let packet = CranPacket::new(PacketType::Status, []);
-            let packet = serializer.serialize(&packet).unwrap();
-            let mut buf = Vec::new();
+            let packet = serializer.serialize(&packet).unwrap().into();
+            let mut stream = Framed::new(stream, LengthDelimitedCodec::new());
 
-            debug!("Sending packet...");
-            stream.write_all(&packet).await?;
+            stream.send(packet).await?;
             info!("Sent packet!");
 
-            stream.readable().await?;
-            debug!("Awaiting packet...");
-            stream.read_buf(&mut buf).await?;
+            let buf: BytesMut = stream.next().await.unwrap()?;
             info!("Recieved packet of length {}", buf.len());
 
-            let packet = packets::process(&*buf).await;
+            let packet = packets::process(&buf).await;
             if let Ok(packet) = packet {
                 match packet.packet_type {
                     packets::PacketType::Status => {
@@ -133,15 +87,56 @@ async fn accept_and_handle_connections(
                 tokio::spawn(async move {
                     // Add this socket to the socketlist and begin recieving packets
                     let info = packets::ClientInfo::new(ip, client_type);
-                    sockets.lock().await.insert(info, s);
-                    handle(info, channel.clone(), sockets.clone())
-                        .await
-                        .unwrap();
+                    let (s_read, s_write) = s.into_split();
+                    sockets.lock().await.insert(info, s_write);
+                    handle(info, channel.clone(), s_read).await.unwrap();
                 });
             }
             Err(e) => error!("Error accepting socket: {:?}", e),
         }
     }
+}
+
+async fn handle(
+    client: packets::ClientInfo,
+    tx: mpsc::Sender<PacketChannel>,
+    s: OwnedReadHalf,
+) -> Result<(), Box<dyn Error>> {
+    let client_type = client.client_type;
+    let ip = client.address;
+    let client_info = packets::ClientInfo::new(ip, client_type);
+    let mut stream = FramedRead::new(s, LengthDelimitedCodec::new());
+    info!("{:?} connection {} accepted.", client_type, ip);
+    tokio::spawn(async move {
+        loop {
+            let buf = stream.try_next().await;
+            match buf {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+                Ok(None) => {
+                    break;
+                }
+                Ok(Some(bytes)) => {
+                    let client_info = packets::ClientInfo::new(ip, client_type);
+                    if let Err(e) = tx.send((client_info, bytes.clone())).await {
+                        error!("Reciever dropped ({})", e);
+                        break;
+                    }
+                }
+            }
+        }
+        info!("Connection with {} terminated.", &client.address);
+        // Send an empty message through the channel to signal for socket closure
+        if let Err(e) = tx.send((client_info, BytesMut::new())).await {
+            error!("Reciever dropped ({})", e);
+        }
+        Ok(())
+    });
+    Ok(())
 }
 
 #[tokio::main]
@@ -179,57 +174,55 @@ async fn main() -> tokio::io::Result<()> {
 
     // Packet processing & response task
     // EXPECTED BEHAVIOUR:
-    //      aproximately 1 thread per queued packet
+    //      1 green thread per queued packet
     //      deserialize packets, pass inner data down to a function
-    //      return, serialize & send response
+    //      return, serialize & send a response packet
     let t_commands = tokio::spawn(async move {
         while let Some((client_info, packet)) = rx.recv().await {
             debug!("Packet recieved through channel: {} bytes", packet.len());
             if packet.is_empty() {
-                error!("Empty packet recieved: closing socket");
+                warn!("Empty packet recieved: closing socket");
                 sockets.lock().await.remove(&client_info);
                 continue;
             }
 
             // dereferenced borrow of `packet`, slightly unusual!
-            debug!("Processing packet (1/3)");
-            let packet = packets::process(&*packet).await.unwrap();
+            let packet = packets::process(&packet)
+                .await
+                .expect("Packet processing failed.");
 
-            use bincode::Options;
-            let serializer = serializer!();
-
-            // TODO (later) move this code into packets::process()
-            use packets::{CranPacket, PacketType, StatusPacket};
-            let response: Option<CranPacket> = match packet.packet_type {
-                PacketType::Status => {
-                    debug!("Status packet recieved");
-                    dbg!(sockets.lock().await);
-                    Some(CranPacket::new(
-                        PacketType::Status,
-                        serializer
-                            .serialize(&StatusPacket {
-                                connected_clients: sockets.lock().await.keys().copied().collect(),
-                            })
-                            .unwrap(),
-                    ))
+            let response: Option<CranPacket> = {
+                use bincode::Options;
+                let serializer = serializer!();
+                match packet.packet_type {
+                    PacketType::Status => {
+                        let s = sockets.lock().await;
+                        Some(CranPacket::new(
+                            PacketType::Status,
+                            serializer
+                                .serialize(&StatusPacket {
+                                    connected_clients: s.keys().copied().collect(),
+                                })
+                                .unwrap(),
+                        ))
+                    }
+                    _ => None,
                 }
-                _ => None,
             };
 
             if let Some(response) = response {
                 use bincode::Options;
-                let packet = serializer!().serialize(&response).unwrap();
+                let packet = BytesMut::from(serializer!().serialize(&response).unwrap().as_slice());
 
-                debug!("Awaiting socket-list lock... (2/3)");
-                let mut sockets = sockets.lock().await;
-                if let Some(stream) = sockets.get_mut(&client_info) {
-                debug!(
-                    "Sending response packet to {}... (3/3)",
-                    &client_info.address
-                );
-                let _ = packets::process(&*packet).await;
-                stream.writable().await.unwrap();
-                stream.write_all(&packet).await.unwrap();
+                if let Some(stream) = sockets.lock().await.get_mut(&client_info) {
+                    let mut sink = FramedWrite::new(stream, LengthDelimitedCodec::new());
+                    debug!(
+                        "Sending response packet to {}...",
+                        &client_info.address
+                    );
+                    // TODO: Remove or replace this with hexdump function
+                    let _ = packets::process(&packet).await;
+                    sink.send(packet.into()).await.unwrap();
                 } else {
                     error!("Failed to send response: socket no longer exists.");
                 }
