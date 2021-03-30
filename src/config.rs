@@ -1,6 +1,8 @@
+use log::warn;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+/// A struct that holds the server's configuration values
 pub struct Config {
     pub client_port: u16,
     pub control_port: u16,
@@ -15,6 +17,7 @@ impl Default for Config {
     }
 }
 
+/// Looks for the configuration file in default locations
 fn find_cfg() -> Option<std::path::PathBuf> {
     let locations = vec!["cranserver.toml", "/etc/cranserver/cranserver.toml"];
 
@@ -27,14 +30,12 @@ fn find_cfg() -> Option<std::path::PathBuf> {
     None
 }
 
-pub fn get_config() -> Result<Option<Config>, Box<dyn std::error::Error>> {
+/// Attempts to find and parse config file, or returns default config if no config exists.
+pub fn get_config() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(cfg) = find_cfg() {
-        Ok(Some(toml::from_str(&std::fs::read_to_string(cfg)?)?))
+        Ok(toml::from_str(&std::fs::read_to_string(cfg)?)?)
     } else {
-        use std::io::{Error, ErrorKind};
-        Err(Box::new(Error::new(
-            ErrorKind::NotFound,
-            "Config file was not found.",
-        )))
+        warn!("No config found. Using default settings");
+        Ok(Default::default())
     }
 }
