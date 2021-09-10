@@ -46,9 +46,7 @@ async fn act_as_client(of_type: packets::ClientType) -> anyhow::Result<()> {
     match of_type {
         ClientType::Client => {
             let packet = CranPacketBuilder::new(PacketType::Status).build();
-            let packet = crate::serde::get_serializer()
-                .serialize(&packet)?
-                .into();
+            let packet = crate::serde::get_serializer().serialize(&packet)?.into();
             let mut stream = Framed::new(stream, LengthDelimitedCodec::new());
 
             stream.send(packet).await?;
@@ -61,8 +59,8 @@ async fn act_as_client(of_type: packets::ClientType) -> anyhow::Result<()> {
             if let Ok(packet) = packet {
                 match packet.packet_type {
                     packets::PacketType::Status => {
-                        let inner: StatusPacket = crate::serde::get_serializer()
-                            .deserialize(&packet.data)?;
+                        let inner: StatusPacket =
+                            crate::serde::get_serializer().deserialize(&packet.data)?;
                         info!("Status retrieved: {:#?}", inner);
                     }
                     _ => {}
@@ -101,6 +99,10 @@ async fn main() -> tokio::io::Result<()> {
     let new_socket_task = |client_type, listen_addr| {
         let tx = tx.clone();
         let sockets = sockets.clone();
+        info!(
+            "Listening for new {:?} connections at {}",
+            client_type, listen_addr
+        );
         tokio::spawn(async move {
             processing::listen_and_accept(client_type, listen_addr, tx, sockets).await;
         })
@@ -156,7 +158,9 @@ async fn main() -> tokio::io::Result<()> {
                     debug!("Sending response packet to {}...", &client_info.address);
                     // TODO: Remove or replace this with hexdump function
                     let _ = processing::process(&packet).await;
-                    sink.send(packet.into()).await.expect("Failed to send response packet");
+                    sink.send(packet.into())
+                        .await
+                        .expect("Failed to send response packet");
                 } else {
                     error!("Failed to send response: socket no longer exists.");
                 }
@@ -165,6 +169,6 @@ async fn main() -> tokio::io::Result<()> {
     });
 
     info!("Initialization done. Ready!");
-    let result = tokio::try_join!(t_clients, t_ctrl, t_commands,)?;
+    tokio::try_join!(t_clients, t_ctrl, t_commands,)?;
     Ok(())
 }

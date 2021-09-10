@@ -31,7 +31,7 @@ fn find_cfg() -> Option<std::path::PathBuf> {
 }
 
 /// Attempts to find and parse config file, or returns default config if no config exists.
-pub fn get_config() -> Result<Config, Box<dyn std::error::Error>> {
+pub fn get_config() -> anyhow::Result<Config> {
     if let Some(cfg) = find_cfg() {
         Ok(toml::from_str(&std::fs::read_to_string(cfg)?)?)
     } else {
